@@ -1,9 +1,29 @@
 --------------------------------STG------------------------
+---Создаем таблицы для исходных данных из API (временные для ресторанов и курьеров, чтоб фиксировать обновления)
+drop table stg.api_couriers_tmp ;
+CREATE TABLE stg.api_couriers_tmp (
+	id serial NOT NULL,
+	json_content text NOT NULL,
+	load_ts timestamp default now(),
+	CONSTRAINT api_couriers_tmp_pkey PRIMARY KEY (id)
+);
+
+drop table stg.api_restaurants_tmp ;
+CREATE TABLE stg.api_restaurants_tmp (
+	id serial NOT NULL,
+	json_content text NOT NULL,
+	load_ts timestamp default now(),
+	CONSTRAINT api_restaurants_tmp_pkey PRIMARY KEY (id)
+);
+
 ---Создаем таблицы для исходных данных из API
 drop table stg.api_couriers_raw ;
 CREATE TABLE stg.api_couriers_raw (
 	id serial NOT NULL,
 	json_content text NOT NULL,
+	first_load_ts timestamp NOT NULL,
+	last_load_ts timestamp,
+    delete_ts timestamp,
 	CONSTRAINT api_couriers_raw_pkey PRIMARY KEY (id)
 );
 
@@ -11,6 +31,9 @@ drop table stg.api_restaurants_raw ;
 CREATE TABLE stg.api_restaurants_raw (
 	id serial NOT NULL,
 	json_content text NOT NULL,
+	first_load_ts timestamp NOT NULL,
+	last_load_ts timestamp,
+    delete_ts timestamp,
 	CONSTRAINT api_restaurants_raw_pkey PRIMARY KEY (id)
 );
 
@@ -18,8 +41,55 @@ drop table stg.api_deliveries_raw ;
 CREATE TABLE stg.api_deliveries_raw (
 	id serial NOT NULL,
 	json_content text NOT NULL,
+	order_ts timestamp not null, -- дата заказа
 	CONSTRAINT api_deliveries_raw_pkey PRIMARY KEY (id)
 );
+
+--------------------------------STG 
+----Закомменчено, так как выполянется в DAG
+/*-- Заполнение таблиц по ресторанам и курьерам
+--Загружаем новые записи (ранее не  существовавшие)
+insert into stg.api_couriers_raw (json_content,first_load_ts,last_load_ts)
+select json_content,load_ts,load_ts
+from stg.api_couriers_tmp
+where json_content not in (select coalesce(json_content,'') from stg.api_couriers_raw);
+
+--Обновляем даты по ранее загруженным записям
+update stg.api_couriers_raw 
+set last_load_ts=t1.load_ts
+from stg.api_couriers_tmp t1
+where api_couriers_raw.json_content=t1.json_content;
+
+--Проставляем даты удаления
+update stg.api_couriers_raw 
+set delete_ts=t1.max_load_ts
+from (select max(load_ts) as max_load_ts from stg.api_couriers_tmp) t1
+where api_couriers_raw.json_content 
+not in (select json_content from stg.api_couriers_tmp);
+
+truncate table stg.api_couriers_tmp;
+
+--Загружаем новые записи (ранее не  существовавшие)
+insert into stg.api_restaurants_raw (json_content,first_load_ts,last_load_ts)
+select json_content,load_ts,load_ts
+from stg.api_restaurants_tmp
+where json_content not in (select coalesce(json_content,'') from stg.api_restaurants_raw);
+
+--Обновляем даты по ранее загруженным записям
+update stg.api_restaurants_raw 
+set last_load_ts=t1.load_ts
+from stg.api_restaurants_tmp t1
+where api_restaurants_raw.json_content=t1.json_content;
+
+--Проставляем даты удаления
+update stg.api_restaurants_raw 
+set delete_ts=t1.max_load_ts
+from (select max(load_ts) as max_load_ts from stg.api_restaurants_tmp) t1
+where api_restaurants_raw.json_content 
+not in (select json_content from stg.api_restaurants_tmp);
+
+truncate table stg.api_restaurants_tmp;
+*/
 
 --------------------------------DDS------------------------
 
@@ -95,14 +165,15 @@ select id,json_content::json->>'_id',json_content::json->>'name'
 from stg.api_couriers_raw;
 
 --Доставки (таблица измерений)
-truncate table dds.dm_deliveries cascade;
+
 insert into dds.dm_deliveries
 select id,json_content::json->>'delivery_id',(json_content::json->>'delivery_ts')::timestamp
 ,json_content::json->>'address'
-from stg.api_deliveries_raw;
+from stg.api_deliveries_raw
+where id not in (select coalesce(id,0) from dds.dm_deliveries);
 
 --Доставки (таблица фактов)
-truncate table dds.fct_deliveries cascade;
+
 insert into dds.fct_deliveries (delivery_id,order_id,courier_id,rate,sum,tip_sum)
 select d.id,o.id,c.id,(stg_d.rate::numeric(14,2))*1.0,stg_d.sum::numeric(14,2),stg_d.tip_sum::numeric(14,2)
 from
@@ -113,7 +184,8 @@ from
 ,json_content::json->>'rate' as rate
 ,json_content::json->>'sum' as sum
 ,json_content::json->>'tip_sum' as tip_sum
-from stg.api_deliveries_raw) as stg_d
+from stg.api_deliveries_raw
+where id not in (select coalesce(id,0) from dds.dm_deliveries)) as stg_d
 inner join dds.dm_deliveries d on stg_d.delivery_id=d.delivery_id 
 inner join dds.dm_orders o on stg_d.order_id=o.order_key 
 inner join dds.dm_couriers c on stg_d.courier_id=c.courier_id;
@@ -152,3 +224,4 @@ select distinct
 json_content::json->>'courier_id' as courier_id
 ,json_content::json->>'rate' as rate
 from stg.api_deliveries_raw
+
